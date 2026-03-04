@@ -1,285 +1,293 @@
-const router = require('express').Router()
-const multer = require('multer')
-const XLSX   = require('xlsx')
+const router   = require('express').Router()
+const multer   = require('multer')
+const csvParse = require('csv-parse/sync')
 const { auth, db } = require('../config/firebase')
-const { verifyToken, requireRole } = require('../middleware/verifyToken')
 
-// Multer — memory storage, Excel + CSV files, 5MB max
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 5 * 1024 * 1024 },
+  limits: { fileSize: 2 * 1024 * 1024 },
   fileFilter: (req, file, cb) => {
-    const allowed = [
-      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-      'application/vnd.ms-excel',
-      'text/csv',
-      'application/csv',
-      'application/octet-stream', // some OS sends this for .csv
-    ]
-    const ext = file.originalname.split('.').pop().toLowerCase()
-    if (allowed.includes(file.mimetype) || ext === 'xlsx' || ext === 'xls' || ext === 'csv') {
-      cb(null, true)
-    } else {
-      cb(new Error('Only Excel (.xlsx / .xls) or CSV files are allowed.'))
-    }
+    if (!file.originalname.match(/\.csv$/i)) return cb(new Error('Only .csv files allowed'))
+    cb(null, true)
   },
 })
 
-// All routes require a valid Firebase token with role = ADMIN
-router.use(verifyToken, requireRole('ADMIN'))
-
-
-// ─────────────────────────────────────────────────────────────────────────────
-// GET /api/admin/departments
-// ─────────────────────────────────────────────────────────────────────────────
-router.get('/departments', async (req, res) => {
+async function requireAdmin(req, res, next) {
   try {
-    const snapshot = await db.collection('departments').get()
+    const token = (req.headers.authorization || '').replace('Bearer ', '')
+    if (!token) return res.status(401).json({ message: 'No token provided' })
+    const decoded = await auth.verifyIdToken(token)
+    if (decoded.role !== 'ADMIN') return res.status(403).json({ message: 'Admin access only' })
+    req.adminUid = decoded.uid
+    req.user = decoded
+    next()
+  } catch { res.status(401).json({ message: 'Invalid or expired token' }) }
+}
 
-    const departments = snapshot.docs
-      .map(doc => ({ id: doc.id, ...doc.data() }))
-      .filter(d => d.is_active === true)
-      .sort((a, b) => a.name.localeCompare(b.name))
+async function requireAuth(req, res, next) {
+  try {
+    const token = (req.headers.authorization || '').replace('Bearer ', '')
+    if (!token) return res.status(401).json({ message: 'No token' })
+    req.user = await auth.verifyIdToken(token)
+    next()
+  } catch { res.status(401).json({ message: 'Invalid token' }) }
+}
 
+// ─────────────────────────────────────────────────────────────────────────────
+// PUBLIC — no auth
+// ─────────────────────────────────────────────────────────────────────────────
+
+// GET /api/admin/corporations/list
+// Returns all corporations — used by admin to pick their corporation on login
+router.get('/corporations/list', async (req, res) => {
+  try {
+    const snap = await db.collection('corporations').get()   // no filter — avoids needing a Firestore index
+    const corporations = snap.docs.map(doc => ({
+      id:       doc.id,
+      name:     doc.data().name,
+      code:     doc.data().code,
+      district: doc.data().district || '',
+    }))
+    corporations.sort((a, b) => a.name.localeCompare(b.name))
+    res.json({ corporations })
+  } catch (err) {
+    console.error('[GET /admin/corporations/list]', err)
+    res.status(500).json({ message: 'Failed to fetch corporations' })
+  }
+})
+
+// GET /api/departments/public?corpId=kmc
+// Citizen complaint form — returns departments for a specific corporation
+router.get('/public', async (req, res) => {
+  try {
+    const { corpId } = req.query
+    // Filter by corpId only — avoids needing a composite Firestore index
+    let query = corpId
+      ? db.collection('departments').where('corporation_id', '==', corpId)
+      : db.collection('departments')
+    const snap = await query.get()
+    const departments = snap.docs.map(doc => ({
+      id:   doc.id,
+      name: doc.data().name,
+      code: doc.data().code,
+    }))
+    departments.sort((a, b) => a.name.localeCompare(b.name))
     res.json({ departments })
+  } catch (err) {
+    res.status(500).json({ message: 'Failed to fetch departments' })
+  }
+})
 
+// ─────────────────────────────────────────────────────────────────────────────
+// ADMIN ROUTES
+// ─────────────────────────────────────────────────────────────────────────────
+
+// GET /api/admin/departments?corpId=kmc
+// List departments — filtered by corporation if corpId provided
+router.get('/departments', requireAdmin, async (req, res) => {
+  try {
+    const { corpId } = req.query
+    const query = corpId
+      ? db.collection('departments').where('corporation_id', '==', corpId)
+      : db.collection('departments')
+    const snap = await query.get()
+    const departments = []
+    for (const doc of snap.docs) {
+      const data = doc.data()
+      const staffSnap = await db.collection('users')
+        .where('department_id', '==', doc.id)
+        .where('role', '==', 'DEPARTMENT_STAFF')
+        .get()
+      departments.push({
+        id:              doc.id,
+        name:            data.name,
+        code:            data.code,
+        description:     data.description || '',
+        corporation_id:  data.corporation_id || '',
+        corporation_name: data.corporation_name || '',
+        staffCount:      staffSnap.size,
+        createdAt:       data.created_at,
+        is_active:       data.is_active,
+      })
+    }
+    departments.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
+    res.json({ departments })
   } catch (err) {
     console.error('[GET /admin/departments]', err)
-    res.status(500).json({ message: 'Server error.' })
+    res.status(500).json({ message: 'Failed to fetch departments' })
   }
 })
 
-
-// ─────────────────────────────────────────────────────────────────────────────
 // POST /api/admin/department/create
-// Body: { name, code, city, state }
-// ─────────────────────────────────────────────────────────────────────────────
-router.post('/department/create', async (req, res) => {
+// Admin creates a department — must pass corporation_id
+router.post('/department/create', requireAdmin, async (req, res) => {
   try {
-    const { name, code, city, state } = req.body
+    const { name, code, description, corporation_id } = req.body
+    if (!name || !code) return res.status(400).json({ message: 'name and code are required' })
+    if (!corporation_id) return res.status(400).json({ message: 'corporation_id is required' })
 
-    if (!name || !code || !city || !state) {
-      return res.status(400).json({ message: 'name, code, city and state are all required.' })
+    const cleanCode = code.trim().toUpperCase()
+
+    // Check code unique within this corporation
+    const existing = await db.collection('departments')
+      .where('corporation_id', '==', corporation_id)
+      .where('code', '==', cleanCode)
+      .get()
+    if (!existing.empty) return res.status(409).json({ message: `Code "${cleanCode}" already exists in this corporation` })
+
+    // Get corporation name to store alongside
+    const corpDoc = await db.collection('corporations').doc(corporation_id).get()
+    if (!corpDoc.exists) return res.status(404).json({ message: 'Corporation not found' })
+    const corpName = corpDoc.data().name
+
+    const ref = db.collection('departments').doc()
+    const data = {
+      name:             name.trim(),
+      code:             cleanCode,
+      description:      description?.trim() || '',
+      corporation_id,
+      corporation_name: corpName,
+      created_at:       new Date().toISOString(),
+      created_by:       req.adminUid,
+      is_active:        true,
     }
-
-    // Check if department code already exists
-    const existing = await db.collection('departments').get()
-    const duplicate = existing.docs.find(doc =>
-      doc.data().code === code.toUpperCase().trim()
-    )
-
-    if (duplicate) {
-      return res.status(409).json({ message: `Department with code "${code}" already exists.` })
-    }
-
-    const deptRef = await db.collection('departments').add({
-      name:       name.trim(),
-      code:       code.toUpperCase().trim(),
-      city:       city.trim(),
-      state:      state.trim(),
-      is_active:  true,
-      created_by: req.user.uid,
-      created_at: new Date().toISOString(),
-    })
-
-    console.log(`[DEPT CREATED] ${name} (${code}) by ${req.user.uid}`)
-
-    res.status(201).json({
-      message: `Department "${name}" created successfully.`,
-      department: { id: deptRef.id, name, code: code.toUpperCase(), city, state },
-    })
-
+    await ref.set(data)
+    res.status(201).json({ message: 'Department created', department: { id: ref.id, ...data, staffCount: 0 } })
   } catch (err) {
     console.error('[POST /admin/department/create]', err)
-    res.status(500).json({ message: 'Server error.' })
+    res.status(500).json({ message: 'Failed to create department' })
   }
 })
 
-
-// ─────────────────────────────────────────────────────────────────────────────
 // POST /api/admin/staff/upload
-// Body: multipart/form-data { file: <Excel or CSV>, department_id }
-// ─────────────────────────────────────────────────────────────────────────────
-router.post('/staff/upload', upload.single('file'), async (req, res) => {
+// Uploads staff CSV — assigns corporation_id + department_id to each staff member
+router.post('/staff/upload', requireAdmin, upload.single('csv'), async (req, res) => {
   try {
-    const { department_id } = req.body
+    const { departmentId } = req.body
+    if (!departmentId) return res.status(400).json({ message: 'departmentId is required' })
+    if (!req.file)    return res.status(400).json({ message: 'CSV file is required' })
 
-    if (!department_id) {
-      return res.status(400).json({ message: 'department_id is required.' })
+    const deptDoc = await db.collection('departments').doc(departmentId).get()
+    if (!deptDoc.exists) return res.status(404).json({ message: 'Department not found' })
+    const deptData = deptDoc.data()
+    const corporation_id   = deptData.corporation_id   || ''
+    const corporation_name = deptData.corporation_name || ''
+
+    let rows
+    try {
+      rows = csvParse.parse(req.file.buffer.toString('utf-8'), { columns: true, skip_empty_lines: true, trim: true })
+    } catch (e) {
+      return res.status(400).json({ message: 'Invalid CSV: ' + e.message })
     }
 
-    // Verify department exists
-    const deptDoc = await db.collection('departments').doc(department_id).get()
-    if (!deptDoc.exists) {
-      return res.status(404).json({ message: 'Department not found.' })
-    }
-    const department = { id: deptDoc.id, ...deptDoc.data() }
+    if (rows.length === 0) return res.status(400).json({ message: 'CSV is empty' })
 
-    if (!req.file) {
-      return res.status(400).json({ message: 'No file uploaded.' })
-    }
-
-    // Parse Excel or CSV
-    const ext = req.file.originalname.split('.').pop().toLowerCase()
-    let rows = []
-
-    if (ext === 'csv') {
-      // Parse CSV using XLSX (it handles CSV too)
-      const workbook = XLSX.read(req.file.buffer.toString('utf8'), { type: 'string' })
-      const sheet    = workbook.Sheets[workbook.SheetNames[0]]
-      rows = XLSX.utils.sheet_to_json(sheet)
-    } else {
-      // Parse Excel
-      const workbook = XLSX.read(req.file.buffer, { type: 'buffer' })
-      const sheet    = workbook.Sheets[workbook.SheetNames[0]]
-      rows = XLSX.utils.sheet_to_json(sheet)
-    }
-
-    if (rows.length === 0) {
-      return res.status(400).json({ message: 'File is empty or has no valid rows.' })
-    }
-
-    console.log(`[STAFF UPLOAD] ${rows.length} rows from file for dept: ${department.name}`)
-
-    const created = []
-    const skipped = []
-
-    for (const [index, row] of rows.entries()) {
-      const rowNum = index + 2
-
-      // Normalize all keys to lowercase
-      const r = {}
-      for (const key of Object.keys(row)) {
-        r[key.toLowerCase().trim()] = typeof row[key] === 'string'
-          ? row[key].trim()
-          : String(row[key]).trim()
-      }
-
-      const { name, email, phone = null, designation = null } = r
-
-      if (!name || !email) {
-        skipped.push({ row: rowNum, reason: 'Missing name or email', data: r })
-        continue
-      }
-
-      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
-        skipped.push({ row: rowNum, reason: 'Invalid email format', email })
-        continue
-      }
-
-      // Check if email already registered
-      try {
-        await auth.getUserByEmail(email.toLowerCase())
-        skipped.push({ row: rowNum, reason: 'Email already registered', email })
-        continue
-      } catch (e) {
-        if (e.code !== 'auth/user-not-found') {
-          skipped.push({ row: rowNum, reason: 'Error checking email', email })
-          continue
-        }
-      }
-
-      // Create Firebase Auth user
-      const tempPassword = `Staff@${Math.floor(1000 + Math.random() * 9000)}`
-
-      const userRecord = await auth.createUser({
-        email:         email.toLowerCase(),
-        password:      tempPassword,
-        displayName:   name,
-        emailVerified: false,
-      })
-
-      // Set custom claims — role + department_id
-      // This is what enforces department isolation on login
-      await auth.setCustomUserClaims(userRecord.uid, {
-        role:          'DEPARTMENT_STAFF',
-        department_id: department_id,
-      })
-
-      // Save to Firestore users collection
-      await db.collection('users').doc(userRecord.uid).set({
-        name,
-        email:                email.toLowerCase(),
-        phone:                phone !== 'null' ? phone : null,
-        designation:          designation !== 'null' ? designation : null,
-        role:                 'DEPARTMENT_STAFF',
-        department_id,
-        department_name:      department.name,
-        department_code:      department.code,
-        is_active:            true,
-        must_change_password: true,
-        created_by:           req.user.uid,
-        created_at:           new Date().toISOString(),
-      })
-
-      console.log(`[STAFF CREATED] ${email} → dept: ${department.name}`)
-
-      created.push({
-        uid:         userRecord.uid,
-        name,
-        email:       email.toLowerCase(),
-        phone,
-        designation,
-        tempPassword,
-      })
-    }
-
-    res.status(201).json({
-      message:    `Upload complete. ${created.length} accounts created, ${skipped.length} skipped.`,
-      department: { id: department.id, name: department.name },
-      summary:    { total: rows.length, created: created.length, skipped: skipped.length },
-      created,
-      skipped,
+    const normalizedRows = rows.map(row => {
+      const out = {}
+      for (const [k, v] of Object.entries(row)) out[k.trim().toLowerCase()] = (v || '').trim()
+      return out
     })
 
+    for (const col of ['name', 'email', 'password']) {
+      if (!(col in normalizedRows[0])) {
+        return res.status(400).json({ message: `CSV missing required column: "${col}"` })
+      }
+    }
+
+    const results = { created: 0, skipped: 0, errors: [] }
+
+    for (const row of normalizedRows) {
+      const { name, email, password } = row
+      if (!email || !password) { results.errors.push(`Missing email/password for: ${name||'unknown'}`); results.skipped++; continue }
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) { results.errors.push(`Invalid email: ${email}`); results.skipped++; continue }
+      try {
+        try {
+          await auth.getUserByEmail(email)
+          results.skipped++
+          continue
+        } catch (e) {
+          if (e.code !== 'auth/user-not-found') throw e
+        }
+        const userRecord = await auth.createUser({ email, password, displayName: name || '', emailVerified: true })
+        // JWT claims — both corporation_id AND department_id so staff is fully scoped
+        await auth.setCustomUserClaims(userRecord.uid, {
+          role:           'DEPARTMENT_STAFF',
+          corporation_id,
+          department_id:  departmentId,
+        })
+        await db.collection('users').doc(userRecord.uid).set({
+          name:             name || '',
+          email,
+          role:             'DEPARTMENT_STAFF',
+          corporation_id,
+          corporation_name,
+          department_id:    departmentId,
+          department_name:  deptData.name,
+          department_code:  deptData.code,
+          is_active:        true,
+          created_at:       new Date().toISOString(),
+          created_by:       req.adminUid,
+        })
+        results.created++
+        console.log(`[staff/upload] Created ${email} → ${deptData.name} (${corporation_id})`)
+      } catch (e) {
+        results.errors.push(`Failed for ${email}: ${e.message}`)
+        results.skipped++
+      }
+    }
+
+    res.json({ message: 'Upload complete', created: results.created, skipped: results.skipped, errors: results.errors, total: normalizedRows.length })
   } catch (err) {
     console.error('[POST /admin/staff/upload]', err)
-    res.status(500).json({ message: err.message ?? 'Server error during upload.' })
+    res.status(500).json({ message: 'Upload failed: ' + err.message })
   }
 })
 
-
-// ─────────────────────────────────────────────────────────────────────────────
-// GET /api/admin/staff?department_id=xxx
-// ─────────────────────────────────────────────────────────────────────────────
-router.get('/staff', async (req, res) => {
+// GET /api/admin/staff?corpId=kmc
+router.get('/staff', requireAdmin, async (req, res) => {
   try {
-    const { department_id } = req.query
-
-    const snapshot = await db.collection('users').get()
-
-    const staff = snapshot.docs
-      .map(doc => ({ id: doc.id, ...doc.data() }))
-      .filter(d =>
-        d.role === 'DEPARTMENT_STAFF' &&
-        (!department_id || d.department_id === department_id)
-      )
-      .sort((a, b) => new Date(b.created_at) - new Date(a.created_at))
-
-    res.json({ count: staff.length, staff })
-
+    const { corpId } = req.query
+    let query = db.collection('users').where('role', '==', 'DEPARTMENT_STAFF')
+    if (corpId) query = query.where('corporation_id', '==', corpId)
+    const snap = await query.get()
+    const staff = snap.docs.map(doc => ({ id: doc.id, ...doc.data() }))
+    staff.sort((a, b) => new Date(b.created_at) - new Date(a.created_at))
+    res.json({ staff })
   } catch (err) {
-    console.error('[GET /admin/staff]', err)
-    res.status(500).json({ message: 'Server error.' })
+    res.status(500).json({ message: 'Failed to fetch staff' })
   }
 })
 
+// ─────────────────────────────────────────────────────────────────────────────
+// DEPARTMENT STAFF ROUTES
+// ─────────────────────────────────────────────────────────────────────────────
 
-// ─────────────────────────────────────────────────────────────────────────────
-// PATCH /api/admin/staff/:uid/deactivate
-// ─────────────────────────────────────────────────────────────────────────────
-router.patch('/staff/:uid/deactivate', async (req, res) => {
+// GET /api/department/my-info
+router.get('/my-info', requireAuth, async (req, res) => {
   try {
-    const { uid } = req.params
-
-    await auth.updateUser(uid, { disabled: true })
-    await db.collection('users').doc(uid).update({ is_active: false })
-
-    res.json({ message: 'Staff account deactivated successfully.' })
-
+    const deptId = req.user.department_id
+    if (!deptId) return res.status(403).json({ message: 'No department assigned to this account' })
+    const deptDoc = await db.collection('departments').doc(deptId).get()
+    if (!deptDoc.exists) return res.status(404).json({ message: 'Department not found' })
+    res.json({ department: { id: deptDoc.id, ...deptDoc.data() } })
   } catch (err) {
-    console.error('[PATCH /admin/staff/deactivate]', err)
-    res.status(500).json({ message: 'Server error.' })
+    res.status(500).json({ message: 'Failed' })
+  }
+})
+
+// GET /api/department/my-staff
+router.get('/my-staff', requireAuth, async (req, res) => {
+  try {
+    const deptId = req.user.department_id
+    if (!deptId) return res.status(403).json({ message: 'No department' })
+    const snap = await db.collection('users')
+      .where('department_id', '==', deptId)
+      .where('role', '==', 'DEPARTMENT_STAFF')
+      .get()
+    const staff = snap.docs.map(doc => ({ id: doc.id, name: doc.data().name, email: doc.data().email }))
+    res.json({ staff })
+  } catch (err) {
+    res.status(500).json({ message: 'Failed' })
   }
 })
 

@@ -42,24 +42,38 @@ function Mandala({ size = 280, color = '#B5451B', opacity = 0.14, reverse = fals
 }
 
 export default function Login() {
-  const { login } = useAuth()
-  const [role,     setRole]     = useState('citizen')
+  const { loginWithEmail, loginCitizen } = useAuth()
+  const [tab,      setTab]      = useState('citizen')
+  const [aadhaar,  setAadhaar]  = useState('')
+  const [phone,    setPhone]    = useState('')
   const [email,    setEmail]    = useState('')
   const [password, setPassword] = useState('')
   const [showPass, setShowPass] = useState(false)
   const [loading,  setLoading]  = useState(false)
   const [error,    setError]    = useState('')
 
-  const isCitizen = role === 'citizen'
+  const isCitizen = tab === 'citizen'
 
   const handleSubmit = async (e) => {
     e?.preventDefault()
-    if (!email || !password) { setError('Please enter both email and password.'); return }
     setLoading(true); setError('')
     try {
-      await login(email, password)
+      if (isCitizen) {
+        if (!aadhaar || !phone) { setError('Please enter both Aadhaar number and phone.'); return }
+        await loginCitizen(aadhaar.replace(/\s/g, ''), phone)
+      } else {
+        if (!email || !password) { setError('Please enter both email and password.'); return }
+        await loginWithEmail(email, password)
+      }
     } catch (err) {
-      setError(err?.response?.data?.message ?? 'Invalid credentials. Please try again.')
+      const code = err.code
+      if (code === 'auth/invalid-credential' || code === 'auth/wrong-password' || code === 'auth/user-not-found') {
+        setError('Invalid credentials. Please try again.')
+      } else if (code === 'auth/too-many-requests') {
+        setError('Too many attempts. Please wait and try again.')
+      } else {
+        setError(err?.response?.data?.message ?? 'Login failed. Please try again.')
+      }
     } finally {
       setLoading(false)
     }
@@ -163,32 +177,59 @@ export default function Login() {
 
             {/* Role toggle */}
             <div className="role-toggle" style={{ marginBottom: 24 }}>
-              <button className={`role-btn ${isCitizen ? 'active' : 'inactive'}`} onClick={() => { setRole('citizen'); setError('') }}>Citizen</button>
-              <button className={`role-btn ${!isCitizen ? 'active' : 'inactive'}`} onClick={() => { setRole('department'); setError('') }}>Department Official</button>
+              <button className={`role-btn ${isCitizen ? 'active' : 'inactive'}`} onClick={() => { setTab('citizen'); setError('') }}>Citizen</button>
+              <button className={`role-btn ${!isCitizen ? 'active' : 'inactive'}`} onClick={() => { setTab('department'); setError('') }}>Department Staff</button>
             </div>
 
             {/* Form */}
             <form onSubmit={handleSubmit} style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
-              <div>
-                <label style={{ display: 'block', fontFamily: 'Outfit', fontSize: 12, fontWeight: 600, color: 'var(--ink-warm)', marginBottom: 6, letterSpacing: '0.02em' }}>Email Address</label>
-                <input className="input-field" type="email" autoComplete="email"
-                  placeholder={isCitizen ? 'you@example.com' : 'official@dept.gov.in'}
-                  value={email} onChange={e => { setEmail(e.target.value); setError('') }} />
-              </div>
 
-              <div>
-                <label style={{ display: 'block', fontFamily: 'Outfit', fontSize: 12, fontWeight: 600, color: 'var(--ink-warm)', marginBottom: 6, letterSpacing: '0.02em' }}>Password</label>
-                <div style={{ position: 'relative' }}>
-                  <input className="input-field" type={showPass ? 'text' : 'password'}
-                    autoComplete="current-password" placeholder="Enter your password"
-                    value={password} onChange={e => { setPassword(e.target.value); setError('') }}
-                    style={{ paddingRight: 46 }} />
-                  <button type="button" onClick={() => setShowPass(p => !p)}
-                    style={{ position: 'absolute', right: 13, top: '50%', transform: 'translateY(-50%)', background: 'none', border: 'none', cursor: 'pointer', color: 'var(--ink-faint)', display: 'flex' }}>
-                    <Icon name={showPass ? 'eyeOff' : 'eye'} size={16} />
-                  </button>
-                </div>
-              </div>
+              {isCitizen ? (
+                <>
+                  <div>
+                    <label style={{ display: 'block', fontFamily: 'Outfit', fontSize: 12, fontWeight: 600, color: 'var(--ink-warm)', marginBottom: 6, letterSpacing: '0.02em' }}>Aadhaar Number</label>
+                    <input className="input-field" type="text" inputMode="numeric"
+                      placeholder="XXXX XXXX XXXX"
+                      maxLength={14}
+                      value={aadhaar}
+                      onChange={e => {
+                        const digits = e.target.value.replace(/\D/g, '').slice(0, 12)
+                        setAadhaar(digits.replace(/(\d{4})(?=\d)/g, '$1 '))
+                        setError('')
+                      }} />
+                  </div>
+                  <div>
+                    <label style={{ display: 'block', fontFamily: 'Outfit', fontSize: 12, fontWeight: 600, color: 'var(--ink-warm)', marginBottom: 6, letterSpacing: '0.02em' }}>Registered Phone Number</label>
+                    <input className="input-field" type="tel" inputMode="numeric"
+                      placeholder="10-digit mobile number"
+                      maxLength={10}
+                      value={phone}
+                      onChange={e => { setPhone(e.target.value.replace(/\D/g, '').slice(0, 10)); setError('') }} />
+                  </div>
+                </>
+              ) : (
+                <>
+                  <div>
+                    <label style={{ display: 'block', fontFamily: 'Outfit', fontSize: 12, fontWeight: 600, color: 'var(--ink-warm)', marginBottom: 6, letterSpacing: '0.02em' }}>Official Email</label>
+                    <input className="input-field" type="email" autoComplete="email"
+                      placeholder="you@dept.gov.in"
+                      value={email} onChange={e => { setEmail(e.target.value); setError('') }} />
+                  </div>
+                  <div>
+                    <label style={{ display: 'block', fontFamily: 'Outfit', fontSize: 12, fontWeight: 600, color: 'var(--ink-warm)', marginBottom: 6, letterSpacing: '0.02em' }}>Password</label>
+                    <div style={{ position: 'relative' }}>
+                      <input className="input-field" type={showPass ? 'text' : 'password'}
+                        autoComplete="current-password" placeholder="Enter your password"
+                        value={password} onChange={e => { setPassword(e.target.value); setError('') }}
+                        style={{ paddingRight: 46 }} />
+                      <button type="button" onClick={() => setShowPass(p => !p)}
+                        style={{ position: 'absolute', right: 13, top: '50%', transform: 'translateY(-50%)', background: 'none', border: 'none', cursor: 'pointer', color: 'var(--ink-faint)', display: 'flex' }}>
+                        <Icon name={showPass ? 'eyeOff' : 'eye'} size={16} />
+                      </button>
+                    </div>
+                  </div>
+                </>
+              )}
 
               {error && (
                 <div className="error-box">
@@ -199,7 +240,7 @@ export default function Login() {
 
               <button type="submit" className="btn-primary" disabled={loading}
                 style={{ width: '100%', justifyContent: 'center', padding: '13px', fontSize: 15, marginTop: 2, borderRadius: 12 }}>
-                {loading ? 'Signing in…' : `Sign in as ${isCitizen ? 'Citizen' : 'Official'}`}
+                {loading ? 'Signing in…' : isCitizen ? 'Login with Aadhaar' : 'Sign In'}
               </button>
             </form>
 

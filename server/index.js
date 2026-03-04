@@ -20,7 +20,9 @@ app.use(express.urlencoded({ extended: true }))
 // ── Routes ────────────────────────────────────────────────────────────────────
 app.use('/api/admin', require('./routes/admin'))
 app.use('/api/auth',  require('./routes/auth'))
-
+app.use('/api/complaints', require('./routes/complaints'))
+app.use('/api/department', require('./routes/admin'))
+app.use('/api/departments', require('./routes/admin'))
 // ── Health check ──────────────────────────────────────────────────────────────
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', time: new Date().toISOString() })

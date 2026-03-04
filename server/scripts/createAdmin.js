@@ -1,4 +1,4 @@
-require('dotenv').config({ path: '/Users/sreyashdewanjee/Desktop/saarthi_civic/server/.env' })
+require('dotenv').config()
 const { auth, db } = require('../config/firebase')
 
 const admins = [

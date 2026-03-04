@@ -1,49 +1,65 @@
-import { createContext, useContext, useState, useCallback } from 'react'
+import { createContext, useContext, useState, useEffect, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
+import { signInWithEmailAndPassword, signInWithCustomToken, signOut, onAuthStateChanged } from 'firebase/auth'
+import { auth } from '../config/firebase'
 import api from '../utils/api'
 
 const AuthContext = createContext(null)
 
-// Redirect map — extend when dashboards are added
 const ROLE_REDIRECT = {
-  CITIZEN:          '/citizen-dashboard',
-  DEPARTMENT_ADMIN: '/department-dashboard',
   ADMIN:            '/admin-dashboard',
+  DEPARTMENT_STAFF: '/department-dashboard',
+  CITIZEN:          '/citizen-dashboard',
 }
 
 export function AuthProvider({ children }) {
   const navigate = useNavigate()
+  const [user,    setUser]    = useState(null)
+  const [role,    setRole]    = useState(null)
+  const [loading, setLoading] = useState(true)
 
-  const [token, setToken] = useState(() => localStorage.getItem('cp_token') ?? null)
-  const [role,  setRole]  = useState(() => localStorage.getItem('cp_role')  ?? null)
-  const [user,  setUser]  = useState(null)
+  useEffect(() => {
+    const unsubscribe = onAuthStateChanged(auth, async (firebaseUser) => {
+      if (firebaseUser) {
+        const idTokenResult = await firebaseUser.getIdTokenResult(true)
+        setUser({ uid: firebaseUser.uid, email: firebaseUser.email })
+        setRole(idTokenResult.claims.role ?? null)
+      } else {
+        setUser(null)
+        setRole(null)
+      }
+      setLoading(false)
+    })
+    return () => unsubscribe()
+  }, [])
 
-  // ── Called by Login.jsx and AdminLogin.jsx ───────────────────────────
-  const login = useCallback(async (email, password) => {
-    // POST /api/auth/login  →  { token, role, user }
-    const { data } = await api.post('/auth/login', { email, password })
-
-    localStorage.setItem('cp_token', data.token)
-    localStorage.setItem('cp_role',  data.role)
-    setToken(data.token)
-    setRole(data.role)
-    setUser(data.user ?? null)
-
-    navigate(ROLE_REDIRECT[data.role] ?? '/')
+  const loginWithEmail = useCallback(async (email, password) => {
+    const credential    = await signInWithEmailAndPassword(auth, email, password)
+    const idTokenResult = await credential.user.getIdTokenResult(true)
+    navigate(ROLE_REDIRECT[idTokenResult.claims.role] ?? '/')
   }, [navigate])
 
-  const logout = useCallback(() => {
-    localStorage.removeItem('cp_token')
-    localStorage.removeItem('cp_role')
-    setToken(null)
-    setRole(null)
-    setUser(null)
+  const loginCitizen = useCallback(async (aadhaar, phone) => {
+    const { data }      = await api.post('/auth/citizen/login', { aadhaar, phone })
+    const credential    = await signInWithCustomToken(auth, data.customToken)
+    const idTokenResult = await credential.user.getIdTokenResult(true)
+    navigate(ROLE_REDIRECT[idTokenResult.claims.role] ?? '/')
+  }, [navigate])
+
+  const logout = useCallback(async () => {
+    await signOut(auth)
     navigate('/login')
   }, [navigate])
 
   return (
-    <AuthContext.Provider value={{ token, role, user, login, logout, isAuthenticated: !!token }}>
-      {children}
+    <AuthContext.Provider value={{
+      user, role, loading,
+      isAuthenticated: !!user,
+      loginWithEmail,
+      loginCitizen,
+      logout,
+    }}>
+      {!loading && children}
     </AuthContext.Provider>
   )
 }

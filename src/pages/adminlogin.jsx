@@ -41,7 +41,7 @@ function Mandala({ size = 280, color = '#B5451B', opacity = 0.1, reverse = false
 }
 
 export default function AdminLogin() {
-  const { login } = useAuth()
+  const { loginWithEmail } = useAuth()
   const [email,    setEmail]    = useState('')
   const [password, setPassword] = useState('')
   const [showPass, setShowPass] = useState(false)
@@ -53,9 +53,16 @@ export default function AdminLogin() {
     if (!email || !password) { setError('Please fill in both fields.'); return }
     setLoading(true); setError('')
     try {
-      await login(email, password)
+      await loginWithEmail(email, password)
     } catch (err) {
-      setError(err?.response?.data?.message ?? 'Access denied. Invalid credentials.')
+      const code = err.code
+      if (code === 'auth/invalid-credential' || code === 'auth/wrong-password' || code === 'auth/user-not-found') {
+        setError('Access denied. Invalid credentials.')
+      } else if (code === 'auth/too-many-requests') {
+        setError('Too many attempts. Please wait and try again.')
+      } else {
+        setError('Access denied. Invalid credentials.')
+      }
     } finally {
       setLoading(false)
     }
